@@ -91,6 +91,22 @@ class GrandStaffPainter extends CustomPainter {
   final MusicScoreTheme theme;
   final double availableWidth;
 
+  /// Spaces each system's notes in proportion to musical time, so a playhead
+  /// moving at one constant speed reaches every note as it starts to sound.
+  ///
+  /// The system keeps its engraved width: its first event and its last anchor
+  /// (normally the closing barline) stay where engraving put them, and every
+  /// onset in between sits at `x0 + (onset - onset0) * rate`. A barline that
+  /// shares its onset with a note is not an anchor, so it keeps its engraved
+  /// share of the gap before that note.
+  ///
+  /// A system where one rate would set two note centres on a staff closer
+  /// than 1.4 staff spaces, a barline closer than 2.0 after the note before
+  /// it, or a note closer than 0.6 after a barline (each never stricter than
+  /// the engraved gap) keeps engraved spacing. Accidentals and dots are not
+  /// measured. Off by default.
+  final bool proportionalSpacing;
+
   /// Baseline-to-baseline vertical distance between adjacent staves.
   final double staffGap;
 
@@ -219,6 +235,7 @@ class GrandStaffPainter extends CustomPainter {
     required this.theme,
     required this.availableWidth,
     double? staffGap,
+    this.proportionalSpacing = false,
   })  : assert(staffGroup != null || groups != null,
             'Provide either staffGroup or groups'),
         groups = groups ?? [staffGroup!],
@@ -577,10 +594,15 @@ class GrandStaffPainter extends CustomPainter {
   /// on every [PositionedElement] by the layout engine. When two staves have an
   /// event at the same onset, those events are simultaneous and MUST share an
   /// X — that is the whole point of a system.
+  ///
+  /// With [barlinesYieldToNotes], a barline is dropped as an anchor wherever a
+  /// non-barline event shares its onset (see [proportionalSpacing]).
   List<({double onset, double x})> _onsetAnchorsOf(
-    List<PositionedElement> elements,
-  ) {
+    List<PositionedElement> elements, {
+    bool barlinesYieldToNotes = false,
+  }) {
     final byOnset = <double, double>{};
+    final barlineOnly = <double>{};
     for (final pe in elements) {
       final e = pe.element;
       // A GRACE note is deliberately excluded. A grace note has zero musical
@@ -609,6 +631,21 @@ class GrandStaffPainter extends CustomPainter {
       // model can express (down to 1/2048) with a factor of four to spare for
       // nested-tuplet arithmetic.
       final key = (pe.onset * kOnsetGrid).round() / kOnsetGrid;
+      if (barlinesYieldToNotes) {
+        final current = byOnset[key];
+        if (e is Barline) {
+          if (current != null && !barlineOnly.contains(key)) continue;
+          if (current == null || pe.position.dx < current) {
+            byOnset[key] = pe.position.dx;
+            barlineOnly.add(key);
+          }
+        } else if (current == null ||
+            barlineOnly.remove(key) ||
+            pe.position.dx < current) {
+          byOnset[key] = pe.position.dx;
+        }
+        continue;
+      }
       final current = byOnset[key];
       if (current == null || pe.position.dx < current) {
         byOnset[key] = pe.position.dx;
@@ -634,25 +671,12 @@ class GrandStaffPainter extends CustomPainter {
     return anchors.last.x;
   }
 
-  /// Puts every staff of a system on ONE shared horizontal time grid.
-  ///
-  /// This used to align only the content-start and the BARLINES, remapping the
-  /// inside of each measure proportionally to each staff's own spacing. Inside
-  /// a bar the staves therefore disagreed: with four quarters in the treble and
-  /// two halves in the bass, beat 3 landed 38 px apart (>3 staff spaces) — the
-  /// single most damaging engraving defect for keyboard and ensemble music.
-  ///
-  /// Now the anchors are MUSICAL ONSETS. For every onset present on any staff
-  /// the shared X is the widest requirement across staves (so nothing is
-  /// squeezed), and each staff is remapped piecewise-linearly onto that grid.
-  /// Because the shared X is the max of monotonic functions it is itself
-  /// monotonic, so the remap can never reorder a staff's events.
-  void _alignStaves(List<_StaffLayout> layouts) {
-    if (layouts.isEmpty) return;
-
-    final perStaff = [for (final l in layouts) _onsetAnchorsOf(l.elements)];
-    if (perStaff.every((a) => a.isEmpty)) return;
-
+  /// The engraved shared grid for [perStaff]: the union of onsets, and for
+  /// each the X built from the widest step any staff needs. Null when no staff
+  /// has an anchor.
+  ({List<double> onsets, List<double> shared})? _engravedGrid(
+    List<List<({double onset, double x})>> perStaff,
+  ) {
     // Union of every onset on any staff of this system.
     final onsetSet = <double>{};
     for (final anchors in perStaff) {
@@ -661,7 +685,7 @@ class GrandStaffPainter extends CustomPainter {
       }
     }
     final onsets = onsetSet.toList()..sort();
-    if (onsets.isEmpty) return;
+    if (onsets.isEmpty) return null;
 
     // Shared grid, built from the widest STEP any staff needs between
     // consecutive onsets — not from the widest absolute position at each one.
@@ -704,36 +728,154 @@ class GrandStaffPainter extends CustomPainter {
       }
       shared.add(shared[k - 1] + widestStep);
     }
+    return (onsets: onsets, shared: shared);
+  }
 
-    const double leftMargin = 0.0;
+  /// [engraved] respaced so X is linear in onset between its first and last
+  /// entries, keeping the system's engraved width (see [proportionalSpacing]).
+  /// Null when there is no time span to spread over.
+  ({List<double> onsets, List<double> shared})? _proportionalGrid(
+    ({List<double> onsets, List<double> shared}) engraved,
+  ) {
+    final onsets = engraved.onsets;
+    final eng = engraved.shared;
+    if (onsets.length < 2) return null;
+    final duration = onsets.last - onsets.first;
+    final width = eng.last - eng.first;
+    if (duration <= 0 || width <= 0) return null;
+    final rate = width / duration;
+    return (
+      onsets: onsets,
+      shared: [for (final t in onsets) eng.first + (t - onsets.first) * rate],
+    );
+  }
 
+  /// Whether [remap] keeps every staff's ink clear, after the margins web's
+  /// time ruler uses (AB#5394): note centres on one staff at least
+  /// [_kMinNoteGap] apart, a barline at least [_kBeforeBarline] after the note
+  /// before it and at least [_kAfterBarline] before the note after it. A gap
+  /// engraving itself made smaller is held only to its engraved width, so
+  /// this check is never stricter than engraving.
+  bool _clears(
+    List<_StaffLayout> layouts,
+    double Function(int staff, double x) remap,
+  ) {
     for (var s = 0; s < layouts.length; s++) {
-      final anchors = perStaff[s];
-      if (anchors.isEmpty) continue;
-
-      // This staff's own X at each shared onset -> the shared X there.
-      final from = <double>[];
-      for (final onset in onsets) {
-        from.add(_xAtOnset(anchors, onset));
+      final items = [
+        for (final pe in layouts[s].elements)
+          if ((pe.element is Note && !(pe.element as Note).isGraceNote) ||
+              pe.element is Rest ||
+              pe.element is Chord ||
+              pe.element is Tuplet ||
+              pe.element is Barline)
+            pe,
+      ]..sort((x, y) => x.position.dx.compareTo(y.position.dx));
+      for (var i = 1; i < items.length; i++) {
+        final prev = items[i - 1], cur = items[i];
+        final prevBar = prev.element is Barline, curBar = cur.element is Barline;
+        if (!prevBar && !curBar && (cur.onset - prev.onset).abs() < 1e-9) {
+          continue; // simultaneous voices share an x by design
+        }
+        final need = curBar
+            ? _kBeforeBarline
+            : prevBar
+                ? _kAfterBarline
+                : _kMinNoteGap;
+        final engraved = cur.position.dx - prev.position.dx;
+        final gap = remap(s, cur.position.dx) - remap(s, prev.position.dx);
+        final floor = need * staffSpace;
+        if (gap + 1e-6 < (engraved < floor ? engraved : floor)) return false;
       }
+    }
+    return true;
+  }
 
-      double remap(double x) {
-        if (x <= from.first) {
-          final lo = leftMargin, hi = from.first;
-          final sLo = leftMargin, sHi = shared.first;
+  /// Minimum spacing for [_clears], in staff spaces. Web's `MIN_NOTE_GAP`
+  /// (0.354 staff heights), its last-note margin (half a staff height: a
+  /// notehead plus stem and flag), and its first-note margin (half a
+  /// notehead).
+  static const double _kMinNoteGap = 1.4;
+  static const double _kBeforeBarline = 2.0;
+  static const double _kAfterBarline = 0.6;
+
+  /// Maps a staff's own X onto [grid], piecewise-linearly between that staff's
+  /// X at each grid onset ([anchors]).
+  double Function(double) _remapper(
+    List<({double onset, double x})> anchors,
+    ({List<double> onsets, List<double> shared}) grid,
+  ) {
+    const double leftMargin = 0.0;
+    final shared = grid.shared;
+    // This staff's own X at each shared onset -> the shared X there.
+    final from = [for (final onset in grid.onsets) _xAtOnset(anchors, onset)];
+    return (double x) {
+      if (x <= from.first) {
+        final lo = leftMargin, hi = from.first;
+        final sLo = leftMargin, sHi = shared.first;
+        if (hi - lo < 1e-6) return sLo;
+        return sLo + (x - lo) / (hi - lo) * (sHi - sLo);
+      }
+      for (var k = 0; k < from.length - 1; k++) {
+        if (x <= from[k + 1]) {
+          final lo = from[k], hi = from[k + 1];
+          final sLo = shared[k], sHi = shared[k + 1];
           if (hi - lo < 1e-6) return sLo;
           return sLo + (x - lo) / (hi - lo) * (sHi - sLo);
         }
-        for (var k = 0; k < from.length - 1; k++) {
-          if (x <= from[k + 1]) {
-            final lo = from[k], hi = from[k + 1];
-            final sLo = shared[k], sHi = shared[k + 1];
-            if (hi - lo < 1e-6) return sLo;
-            return sLo + (x - lo) / (hi - lo) * (sHi - sLo);
-          }
-        }
-        return x + (shared.last - from.last);
       }
+      return x + (shared.last - from.last);
+    };
+  }
+
+  /// Puts every staff of a system on ONE shared horizontal time grid.
+  ///
+  /// This used to align only the content-start and the BARLINES, remapping the
+  /// inside of each measure proportionally to each staff's own spacing. Inside
+  /// a bar the staves therefore disagreed: with four quarters in the treble and
+  /// two halves in the bass, beat 3 landed 38 px apart (>3 staff spaces) — the
+  /// single most damaging engraving defect for keyboard and ensemble music.
+  ///
+  /// Now the anchors are MUSICAL ONSETS. For every onset present on any staff
+  /// the shared X is the widest requirement across staves (so nothing is
+  /// squeezed), and each staff is remapped piecewise-linearly onto that grid.
+  /// Because the shared X is the max of monotonic functions it is itself
+  /// monotonic, so the remap can never reorder a staff's events.
+  void _alignStaves(List<_StaffLayout> layouts) {
+    if (layouts.isEmpty) return;
+
+    final perStaff = [for (final l in layouts) _onsetAnchorsOf(l.elements)];
+    if (perStaff.every((a) => a.isEmpty)) return;
+
+    final grid = _engravedGrid(perStaff);
+    if (grid == null) return;
+
+    var remaps = [
+      for (final anchors in perStaff)
+        anchors.isEmpty ? null : _remapper(anchors, grid),
+    ];
+
+    if (proportionalSpacing) {
+      final timed = [
+        for (final l in layouts)
+          _onsetAnchorsOf(l.elements, barlinesYieldToNotes: true),
+      ];
+      final engraved = _engravedGrid(timed);
+      final proportional =
+          engraved == null ? null : _proportionalGrid(engraved);
+      if (proportional != null) {
+        final timedRemaps = [
+          for (final anchors in timed)
+            anchors.isEmpty ? null : _remapper(anchors, proportional),
+        ];
+        if (_clears(layouts, (s, x) => timedRemaps[s]?.call(x) ?? x)) {
+          remaps = timedRemaps;
+        }
+      }
+    }
+
+    for (var s = 0; s < layouts.length; s++) {
+      final remap = remaps[s];
+      if (remap == null) continue;
 
       final remapped = <PositionedElement>[];
       for (final pe in layouts[s].elements) {
