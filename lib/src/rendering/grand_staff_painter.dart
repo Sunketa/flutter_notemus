@@ -107,6 +107,14 @@ class GrandStaffPainter extends CustomPainter {
   /// measured. Off by default.
   final bool proportionalSpacing;
 
+  /// Fixed number of measures on every system. Null (the default) or a value
+  /// below 1 packs each system with as many measures as fit [availableWidth].
+  ///
+  /// With a fixed count the last system holds the remainder, and a system may
+  /// be wider than [availableWidth]: the host reads [contentWidth] and scales
+  /// or scrolls. A count at or above the piece's length gives one system.
+  final int? measuresPerSystem;
+
   /// Baseline-to-baseline vertical distance between adjacent staves.
   final double staffGap;
 
@@ -236,6 +244,7 @@ class GrandStaffPainter extends CustomPainter {
     required this.availableWidth,
     double? staffGap,
     this.proportionalSpacing = false,
+    this.measuresPerSystem,
   })  : assert(staffGroup != null || groups != null,
             'Provide either staffGroup or groups'),
         groups = groups ?? [staffGroup!],
@@ -251,7 +260,13 @@ class GrandStaffPainter extends CustomPainter {
   List<_StaffLayout> _layoutSystem(int a, int b) {
     final layouts = [
       for (final staff in _allStaves)
-        _layoutSubStaff(_systemStaff(staff, a, b), measureOffset: a),
+        _layoutSubStaff(
+          _systemStaff(staff, a, b),
+          measureOffset: a,
+          // Only the system that holds the staff's last measure ends the
+          // music; every other system closes on an ordinary barline.
+          finalBarline: b >= staff.measures.length - 1,
+        ),
     ];
     _alignStaves(layouts);
     // An UNBEAMED cross-staff note is moved onto the staff it was sent to, so
@@ -391,7 +406,11 @@ class GrandStaffPainter extends CustomPainter {
     return found ?? Clef(clefType: ClefType.treble);
   }
 
-  _StaffLayout _layoutSubStaff(Staff staff, {int measureOffset = 0}) {
+  _StaffLayout _layoutSubStaff(
+    Staff staff, {
+    int measureOffset = 0,
+    bool finalBarline = true,
+  }) {
     final engine = LayoutEngine(
       staff,
       // Very wide so a system never wraps internally — breaks are decided here.
@@ -401,6 +420,7 @@ class GrandStaffPainter extends CustomPainter {
       // Indices restart at 0 inside a system's sub-staff; this restores the
       // absolute bar number without touching the caller's Measure objects.
       measureNumberOffset: measureOffset,
+      finalBarline: finalBarline,
     );
     final result = engine.layoutWithSignature();
     return _StaffLayout(result.elements, engine);
@@ -558,6 +578,19 @@ class GrandStaffPainter extends CustomPainter {
         .map((s) => s.measures.length)
         .fold<int>(0, (a, b) => a > b ? a : b);
     if (nMeasures == 0) return [(start: 0, end: 0)];
+
+    final perSystem = measuresPerSystem;
+    if (perSystem != null && perSystem > 0) {
+      return [
+        for (var start = 0; start < nMeasures; start += perSystem)
+          (
+            start: start,
+            end: start + perSystem > nMeasures
+                ? nMeasures - 1
+                : start + perSystem - 1,
+          ),
+      ];
+    }
 
     final widths = List<double>.filled(nMeasures, 0);
     for (final staff in _allStaves) {
@@ -1259,6 +1292,7 @@ class GrandStaffPainter extends CustomPainter {
   bool shouldRepaint(covariant GrandStaffPainter oldDelegate) {
     return !identical(oldDelegate.groups, groups) ||
         oldDelegate.staffSpace != staffSpace ||
-        oldDelegate.availableWidth != availableWidth;
+        oldDelegate.availableWidth != availableWidth ||
+        oldDelegate.measuresPerSystem != measuresPerSystem;
   }
 }

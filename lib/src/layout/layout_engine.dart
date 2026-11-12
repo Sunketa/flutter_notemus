@@ -961,6 +961,13 @@ class LayoutEngine {
   /// when the measure carries no explicit `Measure.number`.
   final int measureNumberOffset;
 
+  /// Whether the last measure of [staff] closes with the final (thin-thick)
+  /// barline. True for a whole piece. A caller that lays out one SYSTEM of a
+  /// longer piece as its own sub-staff passes false for every system but the
+  /// one holding the piece's last measure, so a system break is closed by an
+  /// ordinary barline and only the true end of the music gets the final one.
+  final bool finalBarline;
+
   // Fix: SMuFL: Larguras agora consultadas dinamicamente of the metadata
   // Valores de fallback mantidos for compatibilidade
   static const double _gClefWidthFallback = 2.684;
@@ -1026,6 +1033,7 @@ class LayoutEngine {
     this.metadata,
     this.verboseValidation = false, // Silencioso por padrão
     this.measureNumberOffset = 0,
+    this.finalBarline = true,
     spacing.SpacingPreferences? spacingPreferences,
   }) {
     // Initialise spacing engine
@@ -1427,7 +1435,7 @@ class LayoutEngine {
       // 1. Next measure not começar with a
       // 2. Current measure not terminar with a
       if (!nextMeasureStartsWithBarline && !currentMeasureEndsWithBarline) {
-        if (isLast) {
+        if (isLast && finalBarline) {
           // Double barline Final
           cursor.advance(measureEndPadding * staffSpace);
           cursor.addDoubleBarline(positionedElements, onset: onsetCursor);
